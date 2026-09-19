@@ -1,0 +1,934 @@
+cat > bluenexus_full.sh << 'EOF'#!/bin/bash
+# ═══════════════════════════════════════════════════════════════════════════════
+# ██████╗ ██╗ ██╗ ██╗███████╗███╗ ██╗███████╗██╗ ██╗██╗ ██╗███████╗
+# ██╔══██╗██║ ██║ ██║██╔════╝████╗ ██║██╔════╝╚██╗██╔╝██║ ██║██╔════╝
+# ██████╔╝██║ ██║ ██║█████╗ ██╔██╗ ██║█████╗ ╚███╔╝ ██║ ██║███████╗
+# ██╔══██╗██║ ██║ ██║██╔══╝ ██║╚██╗██║██╔══╝ ██╔██╗ ██║ ██║╚════██║
+# ██████╔╝███████╗╚██████╔╝███████╗██║ ╚████║███████╗██╔╝ ██╗╚██████╔╝███████║
+# ╚═════╝ ╚══════╝ ╚═════╝ ╚══════╝╚═╝ ╚═══╝╚══════╝╚═╝ ╚═╝ ╚═════╝ ╚══════╝
+#
+# BLUENEXUS — Plateforme sociale Bluesky complète
+# Version 4.0 — Multi-passes · 0 code mort · Full Bash + Python
+# Auteur : Aissa Mohammedi DSK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+set -u
+
+PORT="${1:-8080}"
+BASE="/tmp/bluenexus"
+mkdir -p "$BASE"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASSE 1 — VÉRIFICATION DE L'ENVIRONNEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo "════════════════════════════════════════════════════════════════"
+echo " BLUENEXUS v4.0 — INITIALISATION"
+echo "════════════════════════════════════════════════════════════════"
+echo ""
+echo "[PASSE 1/4] Vérification de l'environnement..."
+
+if ! command -v python3 >/dev/null 2>&1; then
+echo " ❌ Python 3 introuvable"
+exit 1
+fi
+echo " 🟢 Python : $(python3 --version 2>&1)"
+
+if ! command -v curl >/dev/null 2>&1; then
+echo " ⚠️ curl introuvable (optionnel)"
+else
+echo " 🟢 curl : $(curl --version 2>&1 | head -1 | awk '{print $1, $2}')"
+fi
+
+PY_OK=$(python3 -c "import ssl, json, urllib.request, http.server, socketserver, sqlite3, hashlib, threading, queue; print('OK')" 2>&1)
+if [ "$PY_OK" != "OK" ]; then
+echo " ❌ Modules Python manquants : $PY_OK"
+exit 1
+fi
+echo " 🟢 Modules Python : ssl, json, urllib, http.server, sqlite3, threading"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASSE 2 — GÉNÉRATION DU MOTEUR PYTHON COMPLET
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo "[PASSE 2/4] Génération du moteur Python..."
+echo ""
+
+cat > "$BASE/server.py" << 'PYEOF'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+BLUENEXUS ENGINE — Moteur complet
+6 modules : API · Cache · IA · Search · Feed · UI
+"""
+
+import http.server
+import socketserver
+import json
+import sys
+import os
+import time
+import hashlib
+import threading
+import urllib.request
+import urllib.parse
+import urllib.error
+import ssl
+import re
+import random
+from pathlib import Path
+from datetime import datetime, timezone
+
+# ===============================================================================
+# CONFIGURATION
+# ===============================================================================
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+BASE = Path("/tmp/bluenexus")
+CACHE_DIR = BASE / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+USER_AGENT = "BlueNexus/4.0 (+local)"
+CACHE_TTL = 300 # 5 minutes
+
+# ===============================================================================
+# MODULE 1 — API BLUESKY
+# ===============================================================================
+
+class BlueskyAPI:
+"""Client API Bluesky avec cache intelligent"""
+
+BASE_URL = "https://public.api.bsky.app"
+
+def __init__(self):
+self.lock = threading.Lock()
+self.stats = {"calls": 0, "cache_hits": 0, "errors": 0}
+
+def _cache_path(self, key):
+h = hashlib.md5(key.encode()).hexdigest()
+return CACHE_DIR / f"{h}.json"
+
+def _cache_get(self, key):
+path = self._cache_path(key)
+if not path.exists():
+return None
+try:
+age = time.time() - path.stat().st_mtime
+if age > CACHE_TTL:
+return None
+data = json.loads(path.read_text())
+with self.lock:
+self.stats["cache_hits"] += 1
+return data
+except Exception:
+return None
+
+def _cache_set(self, key, data):
+try:
+path = self._cache_path(key)
+path.write_text(json.dumps(data, ensure_ascii=False))
+except Exception:
+pass
+
+def get(self, path, use_cache=True):
+"""Requête GET vers l'API Bluesky"""
+with self.lock:
+self.stats["calls"] += 1
+
+if use_cache:
+cached = self._cache_get(path)
+if cached:
+return cached
+
+url = self.BASE_URL + path
+try:
+req = urllib.request.Request(url, headers={
+"User-Agent": USER_AGENT,
+"Accept": "application/json"
+})
+with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as r:
+data = json.loads(r.read().decode("utf-8"))
+if use_cache:
+self._cache_set(path, data)
+return data
+except urllib.error.HTTPError as e:
+with self.lock:
+self.stats["errors"] += 1
+return {"error": f"HTTP {e.code}"}
+except Exception as e:
+with self.lock:
+self.stats["errors"] += 1
+return {"error": str(e)}
+
+def profile(self, actor):
+return self.get("/xrpc/app.bsky.actor.getProfile?actor=" +
+urllib.parse.quote(actor))
+
+def feed(self, actor, limit=20):
+return self.get("/xrpc/app.bsky.feed.getAuthorFeed?actor=" +
+urllib.parse.quote(actor) + "&limit=" + str(limit))
+
+def search_actors(self, q, limit=25):
+return self.get("/xrpc/app.bsky.actor.searchActors?q=" +
+urllib.parse.quote(q) + "&limit=" + str(limit))
+
+def search_posts(self, q, limit=25):
+return self.get("/xrpc/app.bsky.feed.searchPosts?q=" +
+urllib.parse.quote(q) + "&limit=" + str(limit))
+
+def suggestions(self, limit=25):
+return self.get("/xrpc/app.bsky.actor.getSuggestions?limit=" + str(limit))
+
+def trending(self, limit=25):
+return self.get("/xrpc/app.bsky.unspecced.getPopularFeedGenerators?limit=" + str(limit))
+
+def get_stats(self):
+with self.lock:
+return dict(self.stats)
+
+
+API = BlueskyAPI()
+
+# ===============================================================================
+# MODULE 2 — IA LOCALE NEXUS
+# ===============================================================================
+
+class NexusAI:
+"""IA locale à base de règles + mémoire de session"""
+
+def __init__(self):
+self.history = []
+self.max_history = 100
+
+self.rules = [
+(r"bonjour|salut|hello|coucou|hey",
+["Salut. Bienvenue sur BlueNexus.",
+"Bonjour. Systèmes prêts.",
+"Salut. Que veux-tu explorer ?",
+"Hello. Plateforme active."]),
+
+(r"qui es[- ]tu|ton nom|tu es qui",
+["Je suis Nexus. IA locale de BlueNexus.",
+"Nexus. Cerveau local, zéro cloud.",
+"Je suis Nexus, forgé par Aissa."]),
+
+(r"que peux[- ]tu faire|tes capacités|tes fonctions",
+["Je peux : chercher des profils, analyser des posts, discuter, mémoriser.",
+"Recherche Bluesky, analyse de profils, chat local, mémorisation."]),
+
+(r"heure|quelle heure",
+["Il est {hour}.",
+"L'heure actuelle : {hour}."]),
+
+(r"date|quel jour",
+["Nous sommes le {date}.",
+"Date : {date}."]),
+
+(r"bluesky|bsky",
+["BlueNexus utilise l'API publique de Bluesky.",
+"Bluesky est la base décentralisée de BlueNexus.",
+"Cherche un handle en haut pour explorer Bluesky."]),
+
+(r"merci|thanks",
+["Avec plaisir.",
+"Pas de problème.",
+"À ton service."]),
+
+(r"au revoir|bye|à plus|ciao",
+["À bientôt.",
+"Au revoir, Maître.",
+"Je reste en veille."]),
+
+(r"aissa|maître|master|dsk",
+["Présent, Maître Aissa.",
+"À tes ordres, Maître.",
+"Oui, Forgeron Suprême."]),
+
+(r"nexus",
+["Nexus est en ligne.",
+"Système Nexus actif.",
+"Cœur Nexus opérationnel."]),
+
+(r"port|serveur",
+["Serveur actif sur le port local.",
+"Tout tourne en local, zéro cloud."]),
+
+(r"cache|mémoire",
+["Cache actif. Mémoire de session : {hist} messages.",
+"Je retiens {hist} interactions."]),
+]
+
+self.generics = [
+"Compris. Dis-m'en plus.",
+"Intéressant. Continue.",
+"Je note.",
+"Bien reçu.",
+"Explique-moi ça.",
+"Noté dans ma mémoire.",
+"Je traite l'information.",
+]
+
+def reply(self, msg):
+m = msg.lower().strip()
+ctx = {
+"hour": datetime.now().strftime("%H:%M:%S"),
+"date": datetime.now().strftime("%d/%m/%Y"),
+"hist": len(self.history),
+}
+
+for pattern, responses in self.rules:
+if re.search(pattern, m):
+rep = random.choice(responses)
+rep = rep.format(**ctx)
+self._remember(msg, rep)
+return rep
+
+rep = random.choice(self.generics)
+self._remember(msg, rep)
+return rep
+
+def _remember(self, user, bot):
+self.history.append({
+"t": datetime.now(timezone.utc).isoformat(),
+"u": user,
+"b": bot,
+})
+if len(self.history) > self.max_history:
+self.history = self.history[-self.max_history:]
+
+def stats(self):
+return {"messages": len(self.history)}
+
+
+AI = NexusAI()
+
+# ===============================================================================
+# MODULE 3 — UTILITAIRES
+# ===============================================================================
+
+def fmt_num(n):
+try:
+n = int(n)
+except (ValueError, TypeError):
+return "0"
+if n >= 1_000_000:
+return f"{n / 1_000_000:.1f}M"
+if n >= 1_000:
+return f"{n / 1_000:.1f}K"
+return str(n)
+
+
+def esc(t):
+if t is None:
+return ""
+return (str(t)
+.replace("&", "&amp;")
+.replace("<", "&lt;")
+.replace(">", "&gt;")
+.replace('"', "&quot;")
+.replace("'", "&#39;"))
+
+
+def time_ago(iso_str):
+if not iso_str:
+return ""
+try:
+t = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+delta = (datetime.now(timezone.utc) - t).total_seconds()
+if delta < 60:
+return f"{int(delta)}s"
+if delta < 3600:
+return f"{int(delta/60)}m"
+if delta < 86400:
+return f"{int(delta/3600)}h"
+return f"{int(delta/86400)}j"
+except Exception:
+return ""
+
+
+def safe_get(d, *keys, default=""):
+cur = d
+for k in keys:
+if isinstance(cur, dict):
+cur = cur.get(k, default)
+else:
+return default
+return cur if cur is not None else default
+
+
+# ===============================================================================
+# MODULE 4 — GÉNÉRATION CSS
+# ===============================================================================
+
+CSS = """
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-font-smoothing:antialiased}
+html,body{width:100%;min-height:100%;background:#000;color:#fff;
+font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",system-ui,sans-serif}
+body{background-image:
+radial-gradient(ellipse at 15% 15%, rgba(0,123,255,0.15) 0%, transparent 50%),
+radial-gradient(ellipse at 85% 85%, rgba(168,85,247,0.15) 0%, transparent 50%);
+min-height:100vh}
+.app{max-width:720px;margin:0 auto;padding:0 16px 120px;min-height:100vh}
+.header{position:sticky;top:0;z-index:100;
+padding:calc(env(safe-area-inset-top) + 16px) 0 16px;
+backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+background:linear-gradient(180deg,rgba(0,0,0,0.95),rgba(0,0,0,0.75) 70%,transparent);
+display:flex;justify-content:space-between;align-items:center;gap:12px}
+.logo{font-size:22px;font-weight:800;letter-spacing:-0.5px;
+background:linear-gradient(90deg,#fff,#00d4ff,#a855f7);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;white-space:nowrap}
+.logo .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#00d4ff;
+margin:0 8px;animation:pulse 1.5s infinite;vertical-align:middle;box-shadow:0 0 12px #00d4ff}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(1.3)}}
+.header-nav{display:flex;gap:6px;align-items:center}
+.nav-link{padding:8px 14px;border-radius:18px;background:rgba(255,255,255,0.04);
+border:1px solid rgba(255,255,255,0.08);color:#aaa;font-size:13px;
+text-decoration:none;transition:all 0.2s;white-space:nowrap}
+.nav-link:hover,.nav-link.active{background:rgba(0,212,255,0.15);border-color:#00d4ff;color:#00d4ff}
+.search-box{margin-bottom:20px;position:relative}
+.search-box input{width:100%;padding:16px 50px 16px 22px;
+background:rgba(255,255,255,0.06);backdrop-filter:blur(20px);
+border:1px solid rgba(255,255,255,0.12);border-radius:28px;color:#fff;
+font-size:15px;outline:none;font-family:inherit;transition:all 0.2s}
+.search-box input:focus{border-color:#00d4ff;background:rgba(0,212,255,0.06);
+box-shadow:0 0 40px rgba(0,212,255,0.2)}
+.search-box input::placeholder{color:rgba(255,255,255,0.4)}
+.search-box button{position:absolute;right:6px;top:50%;transform:translateY(-50%);
+width:40px;height:40px;border-radius:50%;border:none;
+background:linear-gradient(135deg,#00d4ff,#0088cc);color:#000;font-size:18px;
+cursor:pointer;font-weight:700;transition:all 0.2s}
+.search-box button:active{transform:translateY(-50%) scale(0.9)}
+.profile{background:rgba(20,20,30,0.7);backdrop-filter:blur(30px);
+border:1px solid rgba(255,255,255,0.1);border-radius:24px;
+padding:24px;margin-bottom:20px;animation:cardIn 0.4s ease;
+position:relative;overflow:hidden}
+.profile::before{content:"";position:absolute;top:-50%;left:-50%;
+width:200%;height:200%;
+background:radial-gradient(circle,rgba(0,212,255,0.03) 0%,transparent 50%);
+animation:rotateGlow 20s linear infinite;pointer-events:none}
+@keyframes rotateGlow{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+@keyframes cardIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.profile-top{display:flex;gap:18px;align-items:center;margin-bottom:16px;
+position:relative;z-index:1}
+.profile-avatar{width:88px;height:88px;border-radius:50%;border:3px solid #00d4ff;
+object-fit:cover;flex-shrink:0;background:#1a1a2e;
+box-shadow:0 0 30px rgba(0,212,255,0.4)}
+.profile-info{flex:1;min-width:0}
+.profile-name{font-size:22px;font-weight:800;margin-bottom:4px;
+background:linear-gradient(90deg,#fff,#00d4ff);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;
+word-break:break-word}
+.profile-handle{font-size:14px;color:#00d4ff;font-family:monospace;margin-bottom:8px}
+.profile-bio{font-size:13px;color:#aaa;line-height:1.5;word-break:break-word}
+.profile-stats{display:grid;grid-template-columns:repeat(3,1fr);
+gap:10px;margin-top:16px;position:relative;z-index:1}
+.stat{background:rgba(0,0,0,0.3);border-radius:14px;padding:14px;
+text-align:center;transition:all 0.2s}
+.stat:hover{background:rgba(0,212,255,0.08);transform:translateY(-2px)}
+.stat .num{font-size:20px;font-weight:800;color:#00d4ff;margin-bottom:2px}
+.stat .lbl{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:1.5px}
+.actions{display:flex;gap:10px;margin-top:16px;position:relative;z-index:1}
+.action-btn{flex:1;padding:12px 16px;border-radius:14px;
+border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);
+color:#fff;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.2s;
+text-align:center;text-decoration:none;display:flex;align-items:center;
+justify-content:center;gap:6px}
+.action-btn:hover{background:rgba(0,212,255,0.15);border-color:#00d4ff;transform:translateY(-1px)}
+.action-btn.primary{background:linear-gradient(135deg,#00d4ff,#0088cc);
+color:#000;border:none}
+.action-btn.primary:hover{box-shadow:0 8px 30px rgba(0,212,255,0.4)}
+.feed-title{font-size:11px;color:#666;letter-spacing:3px;
+text-transform:uppercase;margin:30px 0 16px;padding-left:4px;
+display:flex;justify-content:space-between;align-items:center}
+.feed-title .count{color:#00d4ff;font-weight:700}
+.post{background:rgba(20,20,30,0.6);backdrop-filter:blur(20px);
+border:1px solid rgba(255,255,255,0.08);border-radius:18px;
+padding:18px 20px;margin-bottom:12px;animation:cardIn 0.3s ease;
+transition:all 0.2s}
+.post:hover{border-color:rgba(0,212,255,0.3);transform:translateY(-2px);
+box-shadow:0 12px 40px rgba(0,0,0,0.4)}
+.post-head{display:flex;gap:10px;align-items:center;margin-bottom:12px}
+.post-avatar{width:40px;height:40px;border-radius:50%;
+background:linear-gradient(135deg,#00d4ff,#a855f7);
+flex-shrink:0;object-fit:cover}
+.post-author{font-size:14px;font-weight:600;color:#fff}
+.post-handle{font-size:11px;color:#666;font-family:monospace}
+.post-time{font-size:11px;color:#555;margin-left:auto}
+.post-text{font-size:14px;line-height:1.55;color:#ddd;
+margin-bottom:12px;word-wrap:break-word}
+.post-image{width:100%;border-radius:12px;margin-bottom:12px;
+max-height:400px;object-fit:cover}
+.post-meta{display:flex;gap:18px;font-size:12px;color:#666;
+padding-top:10px;border-top:1px solid rgba(255,255,255,0.04)}
+.post-meta span{display:flex;gap:5px;align-items:center;
+cursor:pointer;transition:all 0.2s}
+.post-meta span:hover{color:#00d4ff}
+.chat-launcher{position:fixed;bottom:calc(env(safe-area-inset-bottom) + 20px);
+right:20px;width:64px;height:64px;border-radius:50%;
+background:linear-gradient(135deg,#00d4ff,#a855f7);border:none;
+color:#000;font-size:28px;cursor:pointer;z-index:50;
+box-shadow:0 8px 40px rgba(0,212,255,0.5);
+transition:all 0.25s cubic-bezier(0.34,1.56,0.64,1)}
+.chat-launcher:active{transform:scale(0.9)}
+.chat-launcher:hover{transform:scale(1.08);
+box-shadow:0 12px 50px rgba(0,212,255,0.7)}
+.chat-panel{position:fixed;right:0;top:0;height:100%;
+width:min(400px,100vw);background:rgba(10,10,20,0.97);
+backdrop-filter:blur(40px);border-left:1px solid rgba(0,212,255,0.2);
+z-index:60;transform:translateX(100%);
+transition:transform 0.35s cubic-bezier(0.32,0.72,0,1);
+display:flex;flex-direction:column}
+.chat-panel.open{transform:translateX(0)}
+.chat-head{padding:calc(env(safe-area-inset-top) + 20px) 20px 20px;
+border-bottom:1px solid rgba(255,255,255,0.06);
+display:flex;justify-content:space-between;align-items:center}
+.chat-head h3{font-size:13px;font-weight:700;color:#00d4ff;
+letter-spacing:2px;text-transform:uppercase}
+.chat-head .status{color:#4ade80;font-size:10px;margin-left:8px}
+.chat-head button{background:rgba(255,255,255,0.08);border:none;
+color:#fff;width:36px;height:36px;border-radius:50%;
+font-size:18px;cursor:pointer;transition:all 0.2s}
+.chat-head button:hover{background:rgba(255,0,0,0.2);color:#ff4444}
+.chat-body{flex:1;overflow-y:auto;padding:20px;
+display:flex;flex-direction:column;gap:12px}
+.msg{padding:12px 16px;border-radius:18px;font-size:14px;
+line-height:1.5;max-width:85%;word-wrap:break-word;
+animation:msgIn 0.3s ease}
+@keyframes msgIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.msg.bot{background:rgba(30,30,45,0.9);color:#fff;
+align-self:flex-start;border-bottom-left-radius:6px}
+.msg.user{background:linear-gradient(135deg,#00d4ff,#0088cc);
+color:#000;align-self:flex-end;border-bottom-right-radius:6px;font-weight:500}
+.chat-input{display:flex;gap:10px;
+padding:16px 20px calc(env(safe-area-inset-bottom) + 16px);
+border-top:1px solid rgba(255,255,255,0.06);background:rgba(0,0,0,0.3)}
+.chat-input input{flex:1;background:rgba(255,255,255,0.08);
+border:1px solid rgba(255,255,255,0.1);color:#fff;
+padding:14px 18px;border-radius:24px;font-size:15px;
+outline:none;font-family:inherit}
+.chat-input input:focus{border-color:#00d4ff;
+box-shadow:0 0 20px rgba(0,212,255,0.15)}
+.chat-input button{width:48px;height:48px;border-radius:50%;
+border:none;background:linear-gradient(135deg,#00d4ff,#0088cc);
+color:#000;font-size:20px;font-weight:700;cursor:pointer;
+transition:all 0.2s}
+.chat-input button:active{transform:scale(0.9)}
+.result-item{padding:14px 18px;background:rgba(20,20,30,0.6);
+border:1px solid rgba(255,255,255,0.08);border-radius:16px;
+margin-bottom:10px;transition:all 0.2s;text-decoration:none;
+color:inherit;display:block}
+.result-item:hover{background:rgba(0,212,255,0.08);
+border-color:#00d4ff;transform:translateX(4px)}
+.result-item .r-name{font-size:15px;font-weight:600;
+margin-bottom:4px;color:#fff}
+.result-item .r-handle{font-size:12px;color:#00d4ff;
+font-family:monospace;margin-bottom:6px}
+.result-item .r-desc{font-size:12px;color:#888;line-height:1.4}
+.spinner{width:50px;height:50px;margin:60px auto;border-radius:50%;
+background:conic-gradient(from 0deg,#00d4ff,#a855f7,#ff6ec7,#00d4ff);
+animation:spin 1.4s linear infinite;position:relative;
+box-shadow:0 0 50px rgba(0,212,255,0.4)}
+.spinner::after{content:"";position:absolute;inset:6px;
+border-radius:50%;background:#000}
+@keyframes spin{to{transform:rotate(360deg)}}
+.empty{text-align:center;padding:80px 20px;color:#555}
+.empty .icon{font-size:80px;opacity:0.3;margin-bottom:18px}
+.empty h2{font-size:18px;color:#666;font-weight:500;margin-bottom:8px}
+.empty p{font-size:13px;color:#444}
+.footer{text-align:center;padding:40px 20px 20px;color:#333;
+font-size:11px;letter-spacing:3px;text-transform:uppercase;
+border-top:1px solid rgba(255,255,255,0.04);margin-top:40px}
+.footer b{color:#00d4ff}
+.badge{display:inline-block;padding:2px 8px;border-radius:8px;
+background:rgba(0,212,255,0.15);color:#00d4ff;font-size:10px;
+font-weight:700;margin-left:6px}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:rgba(255,255,255,0.02)}
+::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#00d4ff,#a855f7);border-radius:3px}
+@media(max-width:500px){
+.profile-avatar{width:64px;height:64px}
+.profile-name{font-size:19px}
+.stat .num{font-size:17px}
+.header-nav{display:none}
+.logo{font-size:19px}
+}
+"""
+
+# ===============================================================================
+# MODULE 5 — GÉNÉRATION JS
+# ===============================================================================
+
+JS_CORE = """
+function go(q){
+if(!q)return;
+window.location.href='/?actor='+encodeURIComponent(q);
+}
+function toggleChat(){
+document.getElementById('chat').classList.toggle('open');
+}
+function sendChat(){
+const inp=document.getElementById('chat-input');
+const txt=inp.value.trim();
+if(!txt)return;
+inp.value='';
+const body=document.getElementById('chat-body');
+const u=document.createElement('div');
+u.className='msg user';
+u.textContent=txt;
+body.appendChild(u);
+body.scrollTop=body.scrollHeight;
+setTimeout(()=>{
+const b=document.createElement('div');
+b.className='msg bot';
+b.textContent=aiReply(txt);
+body.appendChild(b);
+body.scrollTop=body.scrollHeight;
+},400);
+}
+function aiReply(t){
+const m=t.toLowerCase();
+if(m.match(/bonjour|salut|hello|coucou/))return "Salut. Bienvenue sur BlueNexus.";
+if(m.match(/qui es[- ]tu|ton nom/))return "Je suis Nexus, IA locale de BlueNexus.";
+if(m.match(/heure/))return "Il est "+new Date().toLocaleTimeString('fr-FR');
+if(m.match(/date/))return "Nous sommes le "+new Date().toLocaleDateString('fr-FR');
+if(m.match(/bluesky|bsky/))return "BlueNexus agrège Bluesky. Cherche un handle.";
+if(m.match(/merci/))return "Avec plaisir.";
+return "Compris. Dis-m'en plus.";
+}
+document.addEventListener('keydown',function(e){
+if(e.key==='Enter'&&document.activeElement.id==='search'){
+go(document.getElementById('search').value.trim());
+}
+});
+"""
+
+# ===============================================================================
+# MODULE 6 — RENDU DES PAGES
+# ===============================================================================
+
+def render_error(actor, error):
+return f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#000">
+<title>BlueNexus — Erreur</title>
+<style>{CSS}</style></head><body>
+<div class="app">
+<div class="header">
+<div class="logo">BLUE<span class="dot"></span>NEXUS</div>
+</div>
+<div class="search-box">
+<input id="search" placeholder="Cherche un profil..." value="{esc(actor)}">
+<button onclick="go(document.getElementById('search').value.trim())">→</button>
+</div>
+<div class="profile">
+<div class="profile-top">
+<div class="profile-avatar" style="display:flex;align-items:center;justify-content:center;font-size:32px">⚠</div>
+<div class="profile-info">
+<div class="profile-name">Erreur</div>
+<div class="profile-handle">{esc(error)}</div>
+<div class="profile-bio">Le profil "{esc(actor)}" n'existe pas ou l'API Bluesky est inaccessible.</div>
+</div></div></div>
+<div class="footer"><b>BLUENEXUS</b> · Powered by Bluesky API</div>
+</div>
+<script>{JS_CORE}</script>
+</body></html>"""
+
+
+def render_feed_item(item):
+post = item.get("post", {})
+author = post.get("author", {})
+record = post.get("record", {})
+
+text = record.get("text", "")
+likes = post.get("likeCount", 0)
+replies = post.get("replyCount", 0)
+reposts = post.get("repostCount", 0)
+indexed = post.get("indexedAt", "")
+
+author_avatar = author.get("avatar", "")
+author_display = author.get("displayName", "") or author.get("handle", "")
+author_handle = author.get("handle", "")
+
+pa_html = (f'<img class="post-avatar" src="{esc(author_avatar)}" '
+f'onerror="this.style.display=\'none\'">') if author_avatar \
+else '<div class="post-avatar"></div>'
+
+image_html = ""
+embed = post.get("embed", {})
+if embed and embed.get("images"):
+img = embed["images"][0]
+thumb = img.get("thumb", "") or img.get("fullsize", "")
+if thumb:
+image_html = (f'<img class="post-image" src="{esc(thumb)}" '
+f'onerror="this.style.display=\'none\'">')
+
+return f"""
+<div class="post">
+<div class="post-head">
+{pa_html}
+<div>
+<div class="post-author">{esc(author_display)}</div>
+<div class="post-handle">@{esc(author_handle)}</div>
+</div>
+<div class="post-time">{time_ago(indexed)}</div>
+</div>
+<div class="post-text">{esc(text)}</div>
+{image_html}
+<div class="post-meta">
+<span>❤️ {likes}</span>
+<span>💬 {replies}</span>
+<span>🔁 {reposts}</span>
+</div>
+</div>"""
+
+
+def render_profile(actor):
+p = API.profile(actor)
+
+if p.get("error"):
+return render_error(actor, p["error"])
+
+handle = p.get("handle", actor)
+display = p.get("displayName", handle) or handle
+desc = (p.get("description") or "").replace("\n", " ")
+avatar = p.get("avatar", "")
+did = p.get("did", "")
+followers = fmt_num(p.get("followersCount", 0))
+follows = fmt_num(p.get("followsCount", 0))
+posts_count = fmt_num(p.get("postsCount", 0))
+created = p.get("createdAt", "")[:10]
+
+avatar_html = (f'<img class="profile-avatar" src="{esc(avatar)}" '
+f'onerror="this.style.display=\'none\'">') if avatar \
+else '<div class="profile-avatar"></div>'
+
+feed = API.feed(handle, 20)
+feed_items = feed.get("feed", []) if feed else []
+feed_html = "".join(render_feed_item(i) for i in feed_items[:20])
+
+if not feed_html:
+feed_html = '<div class="empty"><div class="icon">📭</div><h2>Aucun post</h2></div>'
+
+return f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000">
+<title>BlueNexus — @{esc(handle)}</title>
+<style>{CSS}</style></head><body>
+<div class="app">
+
+<div class="header">
+<div class="logo">BLUE<span class="dot"></span>NEXUS</div>
+</div>
+
+<div class="search-box">
+<input id="search" placeholder="Cherche un profil Bluesky..." value="{esc(handle)}">
+<button onclick="go(document.getElementById('search').value.trim())">→</button>
+</div>
+
+<div class="profile">
+<div class="profile-top">
+{avatar_html}
+<div class="profile-info">
+<div class="profile-name">{esc(display)}</div>
+<div class="profile-handle">@{esc(handle)}</div>
+<div class="profile-bio">{esc(desc)}</div>
+</div>
+</div>
+<div class="profile-stats">
+<div class="stat"><div class="num">{followers}</div><div class="lbl">Abonnés</div></div>
+<div class="stat"><div class="num">{follows}</div><div class="lbl">Abonnements</div></div>
+<div class="stat"><div class="num">{posts_count}</div><div class="lbl">Posts</div></div>
+</div>
+<div class="actions">
+<a class="action-btn primary" href="https://bsky.app/profile/{esc(handle)}" target="_blank">Voir sur Bluesky</a>
+<a class="action-btn" href="https://bsky.app/profile/{esc(handle)}" target="_blank">Suivre</a>
+</div>
+</div>
+
+<div class="feed-title">
+<span>Derniers posts</span>
+<span class="count">{len(feed_items)}</span>
+</div>
+
+{feed_html}
+
+<div class="footer">
+<b>BLUENEXUS</b> · DID : {esc(did)} · Créé : {esc(created)}
+</div>
+
+</div>
+
+<button class="chat-launcher" onclick="toggleChat()">💬</button>
+
+<div class="chat-panel" id="chat">
+<div class="chat-head">
+<h3>Nexus IA <span class="status">● EN LIGNE</span></h3>
+<button onclick="toggleChat()">✕</button>
+</div>
+<div class="chat-body" id="chat-body">
+<div class="msg bot">Salut. Je suis Nexus. Pose ta question.</div>
+</div>
+<div class="chat-input">
+<input id="chat-input" placeholder="Parle..." onkeydown="if(event.key==='Enter')sendChat()">
+<button onclick="sendChat()">➤</button>
+</div>
+</div>
+
+<script>{JS_CORE}</script>
+</body></html>"""
+
+# ===============================================================================
+# MODULE 7 — SERVEUR HTTP
+# ===============================================================================
+
+class Handler(http.server.BaseHTTPRequestHandler):
+def log_message(self, *a):
+pass
+
+def _json(self, data, code=200):
+body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", "application/json; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def _html(self, html, code=200):
+body = html.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", "text/html; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def _css(self):
+body = CSS.encode("utf-8")
+self.send_response(200)
+self.send_header("Content-Type", "text/css; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def do_GET(self):
+parsed = urllib.parse.urlparse(self.path)
+path = parsed.path
+qs = urllib.parse.parse_qs(parsed.query)
+
+if path == "/style.css":
+return self._css()
+
+if path == "/api/profile":
+actor = qs.get("actor", ["bsky.app"])[0]
+return self._json(API.profile(actor))
+
+if path == "/api/feed":
+actor = qs.get("actor", ["bsky.app"])[0]
+limit = int(qs.get("limit", ["20"])[0])
+return self._json(API.feed(actor, limit))
+
+if path == "/api/search/actors":
+q = qs.get("q", [""])[0]
+return self._json(API.search_actors(q))
+
+if path == "/api/search/posts":
+q = qs.get("q", [""])[0]
+return self._json(API.search_posts(q))
+
+if path == "/api/suggestions":
+return self._json(API.suggestions())
+
+if path == "/api/trending":
+return self._json(API.trending())
+
+if path == "/api/ai":
+q = qs.get("q", [""])[0]
+return self._json({"reply": AI.reply(q)})
+
+if path == "/api/status":
+return self._json({
+"engine": "BlueNexus v4.0",
+"status": "running",
+"port": PORT,
+"api": API.get_stats(),
+"ai": AI.stats(),
+"timestamp": datetime.now(timezone.utc).isoformat(),
+})
+
+actor = qs.get("actor", ["bsky.app"])[0]
+return self._html(render_profile(actor))
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+def main():
+print("════════════════════════════════════════════════════════════════")
+print(" BLUENEXUS v4.0 — ACTIF")
+print("════════════════════════════════════════════════════════════════")
+print(f" 🌐 http://localhost:{PORT}")
+print(f" 📄 Pages : Profil dynamique · Feed · Search")
+print(f" 🔌 APIs : profile · feed · suggestions · search · trending · ai")
+print(f" 🤖 IA : Nexus local")
+print(f" 💾 Cache : {CACHE_DIR}")
+print("════════════════════════════════════════════════════════════════")
+with Server(("0.0.0.0", PORT), Handler) as httpd:
+httpd.serve_forever()
+
+
+if __name__ == "__main__":
+main()
+PYEOF
+
+echo " ✅ Moteur Python généré : $(wc -l < "$BASE/server.py") lignes"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASSE 3 — VALIDATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo "[PASSE 3/4] Validation du moteur..."
+
+if python3 -m py_compile "$BASE/server.py" 2>/dev/null; then
+echo " 🟢 Syntaxe Python OK"
+else
+echo " ❌ Erreur de syntaxe"
+python3 -m py_compile "$BASE/server.py"
+exit 1
+fi
+
+echo " 🟢 Modules : API · IA · Utils · CSS · JS · Render · Server"
+echo " 🟢 Taille : $(du -h "$BASE/server.py" | cut -f1)"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASSE 4 — LANCEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo "[PASSE 4/4] Lancement du serveur..."
+echo ""
+
+python3 "$BASE/server.py" "$PORT"
+EOF
+
+chmod +x bluenexus_full.sh
+./bluenexus_full.sh 8080
