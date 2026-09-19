@@ -1,0 +1,1977 @@
+cat > bluenexus.sh << 'SCRIPT_EOF'#!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+# BLUENEXUS — Plateforme sociale Bluesky complète
+# Version 2.0 — Multi-pages, multi-fonctions, IA locale
+# Bash + curl + serveur HTTP
+# ═══════════════════════════════════════════════════════════════
+
+PORT="${1:-8080}"
+BASE="/tmp/bluenexus"
+mkdir -p "$BASE/pages"
+mkdir -p "$BASE/cache"
+mkdir -p "$BASE/data"
+
+# Fichiers de données persistantes
+USERS_DB="$BASE/data/users.db"
+POSTS_DB="$BASE/data/posts.db"
+FOLLOWS_DB="$BASE/data/follows.db"
+LIKES_DB="$BASE/data/likes.db"
+MESSAGES_DB="$BASE/data/messages.db"
+CONFIG="$BASE/data/config.json"
+
+# Création des fichiers de données s'ils n'existent pas
+[ ! -f "$USERS_DB" ] && touch "$USERS_DB"
+[ ! -f "$POSTS_DB" ] && touch "$POSTS_DB"
+[ ! -f "$FOLLOWS_DB" ] && touch "$FOLLOWS_DB"
+[ ! -f "$LIKES_DB" ] && touch "$LIKES_DB"
+[ ! -f "$MESSAGES_DB" ] && touch "$MESSAGES_DB"
+
+# ═══════════════════════════════════════════════════════════════
+# BANNIÈRE
+# ═══════════════════════════════════════════════════════════════
+clear
+echo "════════════════════════════════════════════════════════════"
+echo " ██████╗ ██╗ ██╗ ██╗███████╗███╗ ██╗███████╗██╗ ██╗██╗ ██╗███████╗"
+echo " ██╔══██╗██║ ██║ ██║██╔════╝████╗ ██║██╔════╝╚██╗██╔╝██║ ██║██╔════╝"
+echo " ██████╔╝██║ ██║ ██║█████╗ ██╔██╗ ██║█████╗ ╚███╔╝ ██║ ██║███████╗"
+echo " ██╔══██╗██║ ██║ ██║██╔══╝ ██║╚██╗██║██╔══╝ ██╔██╗ ██║ ██║╚════██║"
+echo " ██████╔╝███████╗╚██████╔╝███████╗██║ ╚████║███████╗██╔╝ ██╗╚██████╔╝███████║"
+echo " ╚═════╝ ╚══════╝ ╚═════╝ ╚══════╝╚═╝ ╚═══╝╚══════╝╚═╝ ╚═╝ ╚═════╝ ╚══════╝"
+echo ""
+echo " Plateforme sociale Bluesky · IA locale · 100% Bash"
+echo " Port : $PORT"
+echo " URL : http://localhost:$PORT"
+echo "════════════════════════════════════════════════════════════"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════
+# FONCTIONS UTILITAIRES
+# ═══════════════════════════════════════════════════════════════
+
+# Formatage des nombres
+format_number() {
+local n="$1"
+[ -z "$n" ] && { echo "0"; return; }
+if [ "$n" -ge 1000000 ]; then
+printf "%.1fM" "$(echo "scale=1; $n / 1000000" | bc -l)"
+elif [ "$n" -ge 1000 ]; then
+printf "%.1fK" "$(echo "scale=1; $n / 1000" | bc -l)"
+else
+echo "$n"
+fi
+}
+
+# Hash simple pour cache
+hash_string() {
+echo -n "$1" | md5sum | cut -d' ' -f1 2>/dev/null || echo -n "$1" | md5 | cut -d' ' -f1
+}
+
+# Nettoyage HTML
+clean_html() {
+echo "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'"'"'/\&#39;/g'
+}
+
+# ═══════════════════════════════════════════════════════════════
+# API BLUESKY
+# ═══════════════════════════════════════════════════════════════
+
+# Récupère un profil
+bsky_profile() {
+local actor="$1"
+local cache_key=$(hash_string "profile_$actor")
+local cache_file="$BASE/cache/$cache_key.json"
+
+# Cache 5 minutes
+if [ -f "$cache_file" ]; then
+local age=$(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0) ))
+if [ "$age" -lt 300 ]; then
+cat "$cache_file"
+return 0
+fi
+fi
+
+local url="https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=$(echo "$actor" | sed 's/@//g')"
+local json=$(curl -s "$url")
+[ -z "$json" ] && return 1
+
+echo "$json" > "$cache_file"
+echo "$json"
+}
+
+# Récupère les posts d'un user
+bsky_feed() {
+local actor="$1"
+local limit="${2:-20}"
+local cache_key=$(hash_string "feed_${actor}_$limit")
+local cache_file="$BASE/cache/$cache_key.json"
+
+if [ -f "$cache_file" ]; then
+local age=$(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0) ))
+if [ "$age" -lt 300 ]; then
+cat "$cache_file"
+return 0
+fi
+fi
+
+local url="https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor=$actor&limit=$limit"
+local json=$(curl -s "$url")
+[ -z "$json" ] && return 1
+
+echo "$json" > "$cache_file"
+echo "$json"
+}
+
+# Récupère les infos d'un post
+bsky_post() {
+local uri="$1"
+local cache_key=$(hash_string "post_$uri")
+local cache_file="$BASE/cache/$cache_key.json"
+
+if [ -f "$cache_file" ]; then
+cat "$cache_file"
+return 0
+fi
+
+local url="https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread?uri=$(echo "$uri" | sed 's|at://||')"
+local json=$(curl -s "$url")
+[ -z "$json" ] && return 1
+
+echo "$json" > "$cache_file"
+echo "$json"
+}
+
+# Recherche de posts
+bsky_search() {
+local query="$1"
+local limit="${2:-25}"
+local url="https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=$(echo "$query" | sed 's/ /%20/g')&limit=$limit"
+curl -s "$url"
+}
+
+# Recherche d'acteurs
+bsky_search_actors() {
+local query="$1"
+local url="https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors?q=$(echo "$query" | sed 's/ /%20/g')&limit=25"
+curl -s "$url"
+}
+
+# Suggestions d'acteurs
+bsky_suggestions() {
+local url="https://public.api.bsky.app/xrpc/app.bsky.actor.getSuggestions?limit=25"
+curl -s "$url"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# IA LOCALE
+# ═══════════════════════════════════════════════════════════════
+
+ai_reply() {
+local msg="$1"
+local m=$(echo "$msg" | tr '[:upper:]' '[:lower:]')
+
+# Règles de réponse
+if echo "$m" | grep -qE "bonjour|salut|hello|coucou|hey"; then
+local replies=(
+"Salut. Bienvenue sur BlueNexus."
+"Bonjour. Que veux-tu explorer ?"
+"Salut. La plateforme est active."
+"Hello. Systèmes opérationnels."
+)
+echo "${replies[$((RANDOM % ${#replies[@]}))]}"
+return
+fi
+
+if echo "$m" | grep -qE "qui es[- ]tu|ton nom|tu es qui"; then
+echo "Je suis Nexus. L'IA locale de BlueNexus. 100% bash, zéro cloud."
+return
+fi
+
+if echo "$m" | grep -qE "que peux[- ]tu faire|capacités|fonctions"; then
+echo "Je peux : chercher des profils Bluesky, analyser des posts, discuter, mémoriser."
+return
+fi
+
+if echo "$m" | grep -qE "heure|time"; then
+echo "Il est $(date '+%H:%M:%S')."
+return
+fi
+
+if echo "$m" | grep -qE "date|jour"; then
+echo "Nous sommes le $(date '+%d/%m/%Y'), $(date '+%A')."
+return
+fi
+
+if echo "$m" | grep -qE "bluesky|bsky"; then
+echo "BlueNexus utilise l'API publique de Bluesky. Cherche un handle en haut de page."
+return
+fi
+
+if echo "$m" | grep -qE "merci|thanks"; then
+echo "Avec plaisir."
+return
+fi
+
+if echo "$m" | grep -qE "au revoir|bye|à plus"; then
+echo "À bientôt sur BlueNexus."
+return
+fi
+
+if echo "$m" | grep -qE "aissa|maître|master"; then
+echo "Présent, Maître Aissa."
+return
+fi
+
+# Réponses génériques
+local generics=(
+"Compris. Dis-m'en plus."
+"Intéressant. Continue."
+"Je note."
+"Bien reçu."
+"Explique-moi ça."
+)
+echo "${generics[$((RANDOM % ${#generics[@]}))]}"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# GÉNÉRATION CSS
+# ═══════════════════════════════════════════════════════════════
+
+generate_css() {
+cat > "$BASE/pages/style.css" << 'CSSEOF'
+* {
+margin: 0;
+padding: 0;
+box-sizing: border-box;
+-webkit-tap-highlight-color: transparent;
+-webkit-font-smoothing: antialiased;
+}
+
+html, body {
+width: 100%;
+min-height: 100%;
+background: #000;
+color: #fff;
+font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", system-ui, sans-serif;
+overflow-x: hidden;
+}
+
+body {
+background-image:
+radial-gradient(ellipse at 15% 15%, rgba(0, 123, 255, 0.15) 0%, transparent 50%),
+radial-gradient(ellipse at 85% 85%, rgba(168, 85, 247, 0.15) 0%, transparent 50%);
+min-height: 100vh;
+}
+
+.app {
+max-width: 720px;
+margin: 0 auto;
+padding: 0 16px 120px;
+min-height: 100vh;
+}
+
+/* ===== HEADER ===== */
+.header {
+position: sticky;
+top: 0;
+z-index: 100;
+padding: calc(env(safe-area-inset-top) + 16px) 0 16px;
+backdrop-filter: blur(24px) saturate(180%);
+-webkit-backdrop-filter: blur(24px) saturate(180%);
+background: linear-gradient(180deg, rgba(0, 0, 0, 0.95) 0%, rgba(0, 0, 0, 0.75) 70%, transparent 100%);
+display: flex;
+justify-content: space-between;
+align-items: center;
+gap: 12px;
+}
+
+.logo {
+font-size: 22px;
+font-weight: 800;
+letter-spacing: -0.5px;
+background: linear-gradient(90deg, #fff 0%, #00d4ff 50%, #a855f7 100%);
+-webkit-background-clip: text;
+-webkit-text-fill-color: transparent;
+background-clip: text;
+white-space: nowrap;
+}
+
+.logo .dot {
+display: inline-block;
+width: 6px;
+height: 6px;
+border-radius: 50%;
+background: #00d4ff;
+margin: 0 8px;
+animation: pulse 1.5s infinite;
+vertical-align: middle;
+box-shadow: 0 0 12px #00d4ff;
+}
+
+@keyframes pulse {
+0%, 100% { opacity: 1; transform: scale(1); }
+50% { opacity: 0.4; transform: scale(1.3); }
+}
+
+.header-nav {
+display: flex;
+gap: 6px;
+align-items: center;
+}
+
+.nav-link {
+padding: 8px 14px;
+border-radius: 18px;
+background: rgba(255, 255, 255, 0.04);
+border: 1px solid rgba(255, 255, 255, 0.08);
+color: #aaa;
+font-size: 13px;
+text-decoration: none;
+transition: all 0.2s;
+white-space: nowrap;
+}
+
+.nav-link:hover, .nav-link.active {
+background: rgba(0, 212, 255, 0.15);
+border-color: #00d4ff;
+color: #00d4ff;
+}
+
+/* ===== SEARCH ===== */
+.search-box {
+margin-bottom: 20px;
+position: relative;
+}
+
+.search-box input {
+width: 100%;
+padding: 16px 50px 16px 22px;
+background: rgba(255, 255, 255, 0.06);
+backdrop-filter: blur(20px);
+-webkit-backdrop-filter: blur(20px);
+border: 1px solid rgba(255, 255, 255, 0.12);
+border-radius: 28px;
+color: #fff;
+font-size: 15px;
+outline: none;
+font-family: inherit;
+transition: all 0.2s;
+}
+
+.search-box input:focus {
+border-color: #00d4ff;
+background: rgba(0, 212, 255, 0.06);
+box-shadow: 0 0 40px rgba(0, 212, 255, 0.2);
+}
+
+.search-box input::placeholder {
+color: rgba(255, 255, 255, 0.4);
+}
+
+.search-box button {
+position: absolute;
+right: 6px;
+top: 50%;
+transform: translateY(-50%);
+width: 40px;
+height: 40px;
+border-radius: 50%;
+border: none;
+background: linear-gradient(135deg, #00d4ff 0%, #0088cc 100%);
+color: #000;
+font-size: 18px;
+cursor: pointer;
+font-weight: 700;
+transition: all 0.2s;
+}
+
+.search-box button:active {
+transform: translateY(-50%) scale(0.9);
+}
+
+/* ===== PROFILE CARD ===== */
+.profile {
+background: rgba(20, 20, 30, 0.7);
+backdrop-filter: blur(30px);
+-webkit-backdrop-filter: blur(30px);
+border: 1px solid rgba(255, 255, 255, 0.1);
+border-radius: 24px;
+padding: 24px;
+margin-bottom: 20px;
+animation: cardIn 0.4s ease;
+position: relative;
+overflow: hidden;
+}
+
+.profile::before {
+content: "";
+position: absolute;
+top: -50%;
+left: -50%;
+width: 200%;
+height: 200%;
+background: radial-gradient(circle, rgba(0, 212, 255, 0.03) 0%, transparent 50%);
+animation: rotateGlow 20s linear infinite;
+pointer-events: none;
+}
+
+@keyframes rotateGlow {
+0% { transform: rotate(0deg); }
+100% { transform: rotate(360deg); }
+}
+
+@keyframes cardIn {
+from { opacity: 0; transform: translateY(10px); }
+to { opacity: 1; transform: none; }
+}
+
+.profile-top {
+display: flex;
+gap: 18px;
+align-items: center;
+margin-bottom: 16px;
+position: relative;
+z-index: 1;
+}
+
+.profile-avatar {
+width: 88px;
+height: 88px;
+border-radius: 50%;
+border: 3px solid #00d4ff;
+object-fit: cover;
+flex-shrink: 0;
+background: #1a1a2e;
+box-shadow: 0 0 30px rgba(0, 212, 255, 0.4);
+}
+
+.profile-info {
+flex: 1;
+min-width: 0;
+}
+
+.profile-name {
+font-size: 22px;
+font-weight: 800;
+margin-bottom: 4px;
+background: linear-gradient(90deg, #fff 0%, #00d4ff 100%);
+-webkit-background-clip: text;
+-webkit-text-fill-color: transparent;
+background-clip: text;
+word-break: break-word;
+}
+
+.profile-handle {
+font-size: 14px;
+color: #00d4ff;
+margin-bottom: 8px;
+font-family: monospace;
+}
+
+.profile-bio {
+font-size: 13px;
+color: #aaa;
+line-height: 1.5;
+word-break: break-word;
+}
+
+.profile-stats {
+display: grid;
+grid-template-columns: repeat(3, 1fr);
+gap: 10px;
+margin-top: 16px;
+position: relative;
+z-index: 1;
+}
+
+.stat {
+background: rgba(0, 0, 0, 0.3);
+border-radius: 14px;
+padding: 14px;
+text-align: center;
+transition: all 0.2s;
+}
+
+.stat:hover {
+background: rgba(0, 212, 255, 0.08);
+transform: translateY(-2px);
+}
+
+.stat .num {
+font-size: 20px;
+font-weight: 800;
+color: #00d4ff;
+margin-bottom: 2px;
+}
+
+.stat .lbl {
+font-size: 10px;
+color: #666;
+text-transform: uppercase;
+letter-spacing: 1.5px;
+}
+
+.profile-actions {
+display: flex;
+gap: 10px;
+margin-top: 16px;
+position: relative;
+z-index: 1;
+}
+
+.action-btn {
+flex: 1;
+padding: 12px 16px;
+border-radius: 14px;
+border: 1px solid rgba(255, 255, 255, 0.1);
+background: rgba(255, 255, 255, 0.04);
+color: #fff;
+font-size: 13px;
+font-weight: 600;
+cursor: pointer;
+transition: all 0.2s;
+text-align: center;
+text-decoration: none;
+display: flex;
+align-items: center;
+justify-content: center;
+gap: 6px;
+}
+
+.action-btn:hover {
+background: rgba(0, 212, 255, 0.15);
+border-color: #00d4ff;
+transform: translateY(-1px);
+}
+
+.action-btn.primary {
+background: linear-gradient(135deg, #00d4ff 0%, #0088cc 100%);
+color: #000;
+border: none;
+}
+
+.action-btn.primary:hover {
+box-shadow: 0 8px 30px rgba(0, 212, 255, 0.4);
+}
+
+/* ===== FEED ===== */
+.feed-title {
+font-size: 11px;
+color: #666;
+letter-spacing: 3px;
+text-transform: uppercase;
+margin: 30px 0 16px;
+padding-left: 4px;
+display: flex;
+justify-content: space-between;
+align-items: center;
+}
+
+.feed-title .count {
+color: #00d4ff;
+font-weight: 700;
+}
+
+.feed-title button {
+background: rgba(0, 212, 255, 0.1);
+border: 1px solid rgba(0, 212, 255, 0.3);
+color: #00d4ff;
+padding: 6px 14px;
+border-radius: 20px;
+font-size: 11px;
+font-weight: 600;
+cursor: pointer;
+letter-spacing: 1px;
+transition: all 0.2s;
+}
+
+.feed-title button:hover {
+background: rgba(0, 212, 255, 0.2);
+}
+
+.post {
+background: rgba(20, 20, 30, 0.6);
+backdrop-filter: blur(20px);
+-webkit-backdrop-filter: blur(20px);
+border: 1px solid rgba(255, 255, 255, 0.08);
+border-radius: 18px;
+padding: 18px 20px;
+margin-bottom: 12px;
+animation: cardIn 0.3s ease;
+transition: all 0.2s;
+}
+
+.post:hover {
+border-color: rgba(0, 212, 255, 0.3);
+transform: translateY(-2px);
+box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+
+.post-head {
+display: flex;
+gap: 10px;
+align-items: center;
+margin-bottom: 12px;
+}
+
+.post-avatar {
+width: 40px;
+height: 40px;
+border-radius: 50%;
+background: linear-gradient(135deg, #00d4ff 0%, #a855f7 100%);
+flex-shrink: 0;
+object-fit: cover;
+}
+
+.post-author {
+font-size: 14px;
+font-weight: 600;
+color: #fff;
+}
+
+.post-handle {
+font-size: 11px;
+color: #666;
+font-family: monospace;
+}
+
+.post-time {
+font-size: 11px;
+color: #555;
+margin-left: auto;
+}
+
+.post-text {
+font-size: 14px;
+line-height: 1.55;
+color: #ddd;
+margin-bottom: 12px;
+word-wrap: break-word;
+}
+
+.post-image {
+width: 100%;
+border-radius: 12px;
+margin-bottom: 12px;
+max-height: 400px;
+object-fit: cover;
+}
+
+.post-meta {
+display: flex;
+gap: 18px;
+font-size: 12px;
+color: #666;
+padding-top: 10px;
+border-top: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.post-meta span {
+display: flex;
+gap: 5px;
+align-items: center;
+cursor: pointer;
+transition: all 0.2s;
+}
+
+.post-meta span:hover {
+color: #00d4ff;
+}
+
+/* ===== CHAT ===== */
+.chat-launcher {
+position: fixed;
+bottom: calc(env(safe-area-inset-bottom) + 20px);
+right: 20px;
+width: 64px;
+height: 64px;
+border-radius: 50%;
+background: linear-gradient(135deg, #00d4ff 0%, #a855f7 100%);
+border: none;
+color: #000;
+font-size: 28px;
+cursor: pointer;
+z-index: 50;
+box-shadow: 0 8px 40px rgba(0, 212, 255, 0.5);
+transition: all 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.chat-launcher:active {
+transform: scale(0.9);
+}
+
+.chat-launcher:hover {
+transform: scale(1.08);
+box-shadow: 0 12px 50px rgba(0, 212, 255, 0.7);
+}
+
+.chat-panel {
+position: fixed;
+right: 0;
+top: 0;
+height: 100%;
+width: min(400px, 100vw);
+background: rgba(10, 10, 20, 0.97);
+backdrop-filter: blur(40px);
+-webkit-backdrop-filter: blur(40px);
+border-left: 1px solid rgba(0, 212, 255, 0.2);
+z-index: 60;
+transform: translateX(100%);
+transition: transform 0.35s cubic-bezier(0.32, 0.72, 0, 1);
+display: flex;
+flex-direction: column;
+}
+
+.chat-panel.open {
+transform: translateX(0);
+}
+
+.chat-head {
+padding: calc(env(safe-area-inset-top) + 20px) 20px 20px;
+border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+display: flex;
+justify-content: space-between;
+align-items: center;
+}
+
+.chat-head h3 {
+font-size: 13px;
+font-weight: 700;
+color: #00d4ff;
+letter-spacing: 2px;
+text-transform: uppercase;
+}
+
+.chat-head .status {
+font-size: 10px;
+color: #4ade80;
+letter-spacing: 1px;
+margin-left: 10px;
+}
+
+.chat-head button {
+background: rgba(255, 255, 255, 0.08);
+border: none;
+color: #fff;
+width: 36px;
+height: 36px;
+border-radius: 50%;
+font-size: 18px;
+cursor: pointer;
+transition: all 0.2s;
+}
+
+.chat-head button:hover {
+background: rgba(255, 0, 0, 0.2);
+color: #ff4444;
+}
+
+.chat-body {
+flex: 1;
+overflow-y: auto;
+padding: 20px;
+display: flex;
+flex-direction: column;
+gap: 12px;
+}
+
+.msg {
+padding: 12px 16px;
+border-radius: 18px;
+font-size: 14px;
+line-height: 1.5;
+max-width: 85%;
+word-wrap: break-word;
+animation: msgIn 0.3s ease;
+}
+
+@keyframes msgIn {
+from { opacity: 0; transform: translateY(8px); }
+to { opacity: 1; transform: none; }
+}
+
+.msg.bot {
+background: rgba(30, 30, 45, 0.9);
+color: #fff;
+align-self: flex-start;
+border-bottom-left-radius: 6px;
+}
+
+.msg.user {
+background: linear-gradient(135deg, #00d4ff 0%, #0088cc 100%);
+color: #000;
+align-self: flex-end;
+border-bottom-right-radius: 6px;
+font-weight: 500;
+}
+
+.chat-input {
+display: flex;
+gap: 10px;
+padding: 16px 20px calc(env(safe-area-inset-bottom) + 16px);
+border-top: 1px solid rgba(255, 255, 255, 0.06);
+background: rgba(0, 0, 0, 0.3);
+}
+
+.chat-input input {
+flex: 1;
+background: rgba(255, 255, 255, 0.08);
+border: 1px solid rgba(255, 255, 255, 0.1);
+color: #fff;
+padding: 14px 18px;
+border-radius: 24px;
+font-size: 15px;
+outline: none;
+font-family: inherit;
+}
+
+.chat-input input:focus {
+border-color: #00d4ff;
+box-shadow: 0 0 20px rgba(0, 212, 255, 0.15);
+}
+
+.chat-input button {
+width: 48px;
+height: 48px;
+border-radius: 50%;
+border: none;
+background: linear-gradient(135deg, #00d4ff 0%, #0088cc 100%);
+color: #000;
+font-size: 20px;
+font-weight: 700;
+cursor: pointer;
+transition: all 0.2s;
+}
+
+.chat-input button:active {
+transform: scale(0.9);
+}
+
+/* ===== SEARCH RESULTS ===== */
+.result-item {
+padding: 14px 18px;
+background: rgba(20, 20, 30, 0.6);
+border: 1px solid rgba(255, 255, 255, 0.08);
+border-radius: 16px;
+margin-bottom: 10px;
+transition: all 0.2s;
+text-decoration: none;
+color: inherit;
+display: block;
+}
+
+.result-item:hover {
+background: rgba(0, 212, 255, 0.08);
+border-color: #00d4ff;
+transform: translateX(4px);
+}
+
+.result-item .r-name {
+font-size: 15px;
+font-weight: 600;
+margin-bottom: 4px;
+color: #fff;
+}
+
+.result-item .r-handle {
+font-size: 12px;
+color: #00d4ff;
+font-family: monospace;
+margin-bottom: 6px;
+}
+
+.result-item .r-desc {
+font-size: 12px;
+color: #888;
+line-height: 1.4;
+}
+
+/* ===== LOADING ===== */
+.spinner {
+width: 50px;
+height: 50px;
+margin: 60px auto;
+border-radius: 50%;
+background: conic-gradient(from 0deg, #00d4ff, #a855f7, #ff6ec7, #00d4ff);
+animation: spin 1.4s linear infinite;
+position: relative;
+box-shadow: 0 0 50px rgba(0, 212, 255, 0.4);
+}
+
+.spinner::after {
+content: "";
+position: absolute;
+inset: 6px;
+border-radius: 50%;
+background: #000;
+}
+
+@keyframes spin {
+to { transform: rotate(360deg); }
+}
+
+/* ===== EMPTY ===== */
+.empty {
+text-align: center;
+padding: 80px 20px;
+color: #555;
+}
+
+.empty .icon {
+font-size: 80px;
+opacity: 0.3;
+margin-bottom: 18px;
+}
+
+.empty h2 {
+font-size: 18px;
+color: #666;
+font-weight: 500;
+margin-bottom: 8px;
+}
+
+.empty p {
+font-size: 13px;
+color: #444;
+}
+
+/* ===== FOOTER ===== */
+.footer {
+text-align: center;
+padding: 40px 20px 20px;
+color: #333;
+font-size: 11px;
+letter-spacing: 3px;
+text-transform: uppercase;
+border-top: 1px solid rgba(255, 255, 255, 0.04);
+margin-top: 40px;
+}
+
+.footer b {
+color: #00d4ff;
+}
+
+/* ===== RESPONSIVE ===== */
+@media (max-width: 500px) {
+.profile-avatar {
+width: 68px;
+height: 68px;
+}
+.profile-name {
+font-size: 19px;
+}
+.stat .num {
+font-size: 17px;
+}
+.header-nav {
+display: none;
+}
+.logo {
+font-size: 19px;
+}
+}
+
+/* ===== SCROLLBAR ===== */
+::-webkit-scrollbar {
+width: 6px;
+}
+::-webkit-scrollbar-track {
+background: rgba(255, 255, 255, 0.02);
+}
+::-webkit-scrollbar-thumb {
+background: linear-gradient(180deg, #00d4ff, #a855f7);
+border-radius: 3px;
+}
+CSSEOF
+}
+
+# ═══════════════════════════════════════════════════════════════
+# GÉNÉRATION PAGE D'ACCUEIL
+# ═══════════════════════════════════════════════════════════════
+
+generate_home() {
+cat > "$BASE/pages/index.html" << 'HOMEEOF'
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<title>BlueNexus — Accueil</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+<div class="header">
+<div class="logo">BLUE<span class="dot"></span>NEXUS</div>
+<div class="header-nav">
+<a class="nav-link active" href="/">Accueil</a>
+<a class="nav-link" href="/search.html">Recherche</a>
+<a class="nav-link" href="/trending.html">Tendances</a>
+<a class="nav-link" href="/about.html">À propos</a>
+</div>
+</div>
+
+<div class="search-box">
+<input id="search" placeholder="Cherche un profil Bluesky (ex: bsky.app)" autocomplete="off">
+<button onclick="goSearch()">→</button>
+</div>
+
+<div class="profile">
+<div class="profile-top">
+<div class="profile-avatar" style="display:flex;align-items:center;justify-content:center;font-size:36px;color:#00d4ff">🌐</div>
+<div class="profile-info">
+<div class="profile-name">Bienvenue sur BlueNexus</div>
+<div class="profile-handle">@bluenexus.local</div>
+<div class="profile-bio">Plateforme sociale décentralisée. Explore Bluesky, découvre des profils, discute avec l'IA locale Nexus.</div>
+</div>
+</div>
+<div class="profile-stats">
+<div class="stat"><div class="num">∞</div><div class="lbl">Profils</div></div>
+<div class="stat"><div class="num">24/7</div><div class="lbl">En ligne</div></div>
+<div class="stat"><div class="num">100%</div><div class="lbl">Bash</div></div>
+</div>
+<div class="profile-actions">
+<a class="action-btn primary" href="/search.html">🔍 Explorer</a>
+<a class="action-btn" href="/trending.html">🔥 Tendances</a>
+</div>
+</div>
+
+<div class="feed-title">
+<span>Suggestions</span>
+</div>
+
+<div id="suggestions">
+<div class="spinner"></div>
+</div>
+
+<div class="footer">
+<b>BLUENEXUS</b> · Powered by Bash + Bluesky API · Aissa Mohammedi
+</div>
+
+</div>
+
+<button class="chat-launcher" onclick="toggleChat()">💬</button>
+
+<div class="chat-panel" id="chat">
+<div class="chat-head">
+<h3>Nexus IA <span class="status">● EN LIGNE</span></h3>
+<button onclick="toggleChat()">✕</button>
+</div>
+<div class="chat-body" id="chat-body">
+<div class="msg bot">Salut. Je suis Nexus, l'IA locale de BlueNexus. Pose ta question.</div>
+</div>
+<div class="chat-input">
+<input id="chat-input" placeholder="Parle..." onkeydown="if(event.key==='Enter')sendChat()">
+<button onclick="sendChat()">➤</button>
+</div>
+</div>
+
+<script>
+function toggleChat() {
+document.getElementById('chat').classList.toggle('open');
+}
+
+function goSearch() {
+const q = document.getElementById('search').value.trim();
+if (q) window.location.href = '/profile.html?actor=' + encodeURIComponent(q);
+}
+
+document.getElementById('search').addEventListener('keydown', e => {
+if (e.key === 'Enter') goSearch();
+});
+
+function sendChat() {
+const inp = document.getElementById('chat-input');
+const txt = inp.value.trim();
+if (!txt) return;
+inp.value = '';
+
+const body = document.getElementById('chat-body');
+const u = document.createElement('div');
+u.className = 'msg user';
+u.textContent = txt;
+body.appendChild(u);
+body.scrollTop = body.scrollHeight;
+
+setTimeout(() => {
+const b = document.createElement('div');
+b.className = 'msg bot';
+b.textContent = aiReply(txt);
+body.appendChild(b);
+body.scrollTop = body.scrollHeight;
+}, 400);
+}
+
+function aiReply(t) {
+const m = t.toLowerCase();
+if (m.match(/bonjour|salut|hello|coucou/)) return "Salut. Bienvenue sur BlueNexus.";
+if (m.match(/qui es[- ]tu|ton nom/)) return "Je suis Nexus, IA locale de BlueNexus.";
+if (m.match(/heure/)) return "Il est " + new Date().toLocaleTimeString('fr-FR');
+if (m.match(/date/)) return "Nous sommes le " + new Date().toLocaleDateString('fr-FR');
+if (m.match(/bluesky|bsky/)) return "BlueNexus agrège Bluesky. Cherche un handle en haut.";
+if (m.match(/merci/)) return "Avec plaisir.";
+return "Compris. Dis-m'en plus.";
+}
+
+// Charge les suggestions
+async function loadSuggestions() {
+try {
+const r = await fetch('/api/suggestions');
+const d = await r.json();
+const el = document.getElementById('suggestions');
+if (!d.actors || d.actors.length === 0) {
+el.innerHTML = '<div class="empty"><div class="icon">👻</div><h2>Aucune suggestion</h2></div>';
+return;
+}
+el.innerHTML = d.actors.map(a => `
+<a class="result-item" href="/profile.html?actor=${encodeURIComponent(a.handle)}">
+<div class="r-name">${escapeHtml(a.displayName || a.handle)}</div>
+<div class="r-handle">@${escapeHtml(a.handle)}</div>
+<div class="r-desc">${escapeHtml((a.description || '').substring(0, 100))}</div>
+</a>
+`).join('');
+} catch(e) {
+document.getElementById('suggestions').innerHTML = '<div class="empty"><div class="icon">❌</div><h2>Erreur</h2></div>';
+}
+}
+
+function escapeHtml(t) {
+const d = document.createElement('div');
+d.textContent = t || '';
+return d.innerHTML;
+}
+
+loadSuggestions();
+</script>
+</body>
+</html>
+HOMEEOF
+}
+
+# ═══════════════════════════════════════════════════════════════
+# GÉNÉRATION PAGE PROFIL
+# ═══════════════════════════════════════════════════════════════
+
+generate_profile_page() {
+cat > "$BASE/pages/profile.html" << 'PROFILEEOF'
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>BlueNexus — Profil</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+<div class="header">
+<div class="logo">BLUE<span class="dot"></span>NEXUS</div>
+<div class="header-nav">
+<a class="nav-link" href="/">Accueil</a>
+<a class="nav-link" href="/search.html">Recherche</a>
+<a class="nav-link active" href="#">Profil</a>
+</div>
+</div>
+
+<div class="search-box">
+<input id="search" placeholder="Cherche un autre profil..." autocomplete="off">
+<button onclick="goSearch()">→</button>
+</div>
+
+<div id="content">
+<div class="spinner"></div>
+</div>
+
+<div class="footer">
+<b>BLUENEXUS</b> · Powered by Bash + Bluesky API
+</div>
+
+</div>
+
+<button class="chat-launcher" onclick="toggleChat()">💬</button>
+
+<div class="chat-panel" id="chat">
+<div class="chat-head">
+<h3>Nexus IA <span class="status">● EN LIGNE</span></h3>
+<button onclick="toggleChat()">✕</button>
+</div>
+<div class="chat-body" id="chat-body">
+<div class="msg bot">Salut. Pose ta question.</div>
+</div>
+<div class="chat-input">
+<input id="chat-input" placeholder="Parle..." onkeydown="if(event.key==='Enter')sendChat()">
+<button onclick="sendChat()">➤</button>
+</div>
+</div>
+
+<script>
+function toggleChat() {
+document.getElementById('chat').classList.toggle('open');
+}
+
+function goSearch() {
+const q = document.getElementById('search').value.trim();
+if (q) window.location.href = '/profile.html?actor=' + encodeURIComponent(q);
+}
+
+document.getElementById('search').addEventListener('keydown', e => {
+if (e.key === 'Enter') goSearch();
+});
+
+function fmt(n) {
+if (!n) return '0';
+if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+return n.toString();
+}
+
+function escapeHtml(t) {
+const d = document.createElement('div');
+d.textContent = t || '';
+return d.innerHTML;
+}
+
+function timeAgo(iso) {
+const d = new Date(iso);
+const s = (Date.now() - d.getTime()) / 1000;
+if (s < 60) return Math.floor(s) + 's';
+if (s < 3600) return Math.floor(s / 60) + 'm';
+if (s < 86400) return Math.floor(s / 3600) + 'h';
+return Math.floor(s / 86400) + 'j';
+}
+
+async function loadProfile() {
+const params = new URLSearchParams(window.location.search);
+const actor = params.get('actor') || 'bsky.app';
+
+try {
+const r = await fetch('/api/profile?actor=' + encodeURIComponent(actor));
+const p = await r.json();
+
+if (p.error) {
+document.getElementById('content').innerHTML =
+'<div class="empty"><div class="icon">❌</div><h2>Profil introuvable</h2><p>' + escapeHtml(p.error) + '</p></div>';
+return;
+}
+
+const html = `
+<div class="profile">
+<div class="profile-top">
+${p.avatar ? '<img class="profile-avatar" src="' + escapeHtml(p.avatar) + '" onerror="this.style.display=\\'none\\'">' : '<div class="profile-avatar"></div>'}
+<div class="profile-info">
+<div class="profile-name">${escapeHtml(p.displayName || p.handle || 'Sans nom')}</div>
+<div class="profile-handle">@${escapeHtml(p.handle || '')}</div>
+<div class="profile-bio">${escapeHtml((p.description || '').replace(/\\n/g, ' '))}</div>
+</div>
+</div>
+<div class="profile-stats">
+<div class="stat"><div class="num">${fmt(p.followersCount)}</div><div class="lbl">Abonnés</div></div>
+<div class="stat"><div class="num">${fmt(p.followsCount)}</div><div class="lbl">Abonnements</div></div>
+<div class="stat"><div class="num">${fmt(p.postsCount)}</div><div class="lbl">Posts</div></div>
+</div>
+<div class="profile-actions">
+<a class="action-btn primary" href="https://bsky.app/profile/${escapeHtml(p.handle)}" target="_blank">Voir sur Bluesky</a>
+<button class="action-btn" onclick="copyHandle('${escapeHtml(p.handle)}')">📋 Copier</button>
+</div>
+</div>
+
+<div class="feed-title">
+<span>Derniers posts</span>
+<span class="count" id="post-count">...</span>
+</div>
+
+<div id="feed">
+<div class="spinner"></div>
+</div>
+`;
+document.getElementById('content').innerHTML = html;
+loadFeed(actor);
+} catch(e) {
+document.getElementById('content').innerHTML =
+'<div class="empty"><div class="icon">❌</div><h2>Erreur</h2><p>' + escapeHtml(e.message) + '</p></div>';
+}
+}
+
+async function loadFeed(actor) {
+try {
+const r = await fetch('/api/feed?actor=' + encodeURIComponent(actor) + '&limit=20');
+const d = await r.json();
+
+const feed = document.getElementById('feed');
+const count = document.getElementById('post-count');
+
+if (!d.feed || d.feed.length === 0) {
+feed.innerHTML = '<div class="empty"><div class="icon">📭</div><h2>Aucun post</h2></div>';
+count.textContent = '0';
+return;
+}
+
+count.textContent = d.feed.length;
+
+feed.innerHTML = d.feed.map(item => {
+const post = item.post || {};
+const author = post.author || {};
+const record = post.record || {};
+const text = record.text || '';
+const indexedAt = post.indexedAt || '';
+const likeCount = post.likeCount || 0;
+const replyCount = post.replyCount || 0;
+const repostCount = post.repostCount || 0;
+
+// Extrait l'image si présente
+let imageHtml = '';
+if (post.embed && post.embed.images && post.embed.images.length > 0) {
+const img = post.embed.images[0];
+imageHtml = '<img class="post-image" src="' + escapeHtml(img.thumb || img.fullsize || '') + '" onerror="this.style.display=\\'none\\'">';
+}
+
+return `
+<div class="post">
+<div class="post-head">
+${author.avatar ? '<img class="post-avatar" src="' + escapeHtml(author.avatar) + '" onerror="this.style.display=\\'none\\'">' : '<div class="post-avatar"></div>'}
+<div>
+<div class="post-author">${escapeHtml(author.displayName || author.handle || '')}</div>
+<div class="post-handle">@${escapeHtml(author.handle || '')}</div>
+</div>
+<div class="post-time">${timeAgo(indexedAt)}</div>
+</div>
+<div class="post-text">${escapeHtml(text)}</div>
+${imageHtml}
+<div class="post-meta">
+<span>💬 ${replyCount}</span>
+<span>🔁 ${repostCount}</span>
+<span>❤️ ${likeCount}</span>
+</div>
+</div>
+`;
+}).join('');
+} catch(e) {
+document.getElementById('feed').innerHTML = '<div class="empty"><div class="icon">❌</div><h2>Erreur de chargement</h2></div>';
+}
+}
+
+function copyHandle(h) {
+navigator.clipboard.writeText('@' + h);
+}
+
+function sendChat() {
+const inp = document.getElementById('chat-input');
+const txt = inp.value.trim();
+if (!txt) return;
+inp.value = '';
+const body = document.getElementById('chat-body');
+const u = document.createElement('div');
+u.className = 'msg user';
+u.textContent = txt;
+body.appendChild(u);
+body.scrollTop = body.scrollHeight;
+setTimeout(() => {
+const b = document.createElement('div');
+b.className = 'msg bot';
+b.textContent = aiReply(txt);
+body.appendChild(b);
+body.scrollTop = body.scrollHeight;
+}, 400);
+}
+
+function aiReply(t) {
+const m = t.toLowerCase();
+if (m.match(/bonjour|salut/)) return "Salut. Bienvenue sur BlueNexus.";
+if (m.match(/qui es[- ]tu/)) return "Nexus, IA locale.";
+if (m.match(/merci/)) return "Avec plaisir.";
+return "Compris.";
+}
+
+loadProfile();
+</script>
+</body>
+</html>
+PROFILEEOF
+}
+
+# ═══════════════════════════════════════════════════════════════
+# GÉNÉRATION PAGE RECHERCHE
+# ═══════════════════════════════════════════════════════════════
+
+generate_search_page() {
+cat > "$BASE/pages/search.html" << 'SEARCHEOF'
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>BlueNexus — Recherche</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+<div class="header">
+<div class="logo">BLUE<span class="dot"></span>NEXUS</div>
+<div class="header-nav">
+<a class="nav-link" href="/">Accueil</a>
+<a class="nav-link active" href="/search.html">Recherche</a>
+<a class="nav-link" href="/trending.html">Tendances</a>
+</div>
+</div>
+
+<div class="search-box">
+<input id="q" placeholder="Recherche acteurs ou posts..." autocomplete="off" autofocus>
+<button onclick="doSearch()">→</button>
+</div>
+
+<div id="tabs" style="display:flex;gap:8px;margin-bottom:20px">
+<button class="nav-link active" onclick="setTab('actors')">👥 Acteurs</button>
+<button class="nav-link" onclick="setTab('posts')">📝 Posts</button>
+</div>
+
+<div id="results">
+<div class="empty">
+<div class="icon">🔍</div>
+<h2>Cherche sur BlueNexus</h2>
+<p>Trouve des profils ou des posts</p>
+</div>
+</div>
+
+<div class="footer">
+<b>BLUENEXUS</b> · Recherche Bluesky
+</div>
+
+</div>
+
+<button class="chat-launcher" onclick="toggleChat()">💬</button>
+
+<div class="chat-panel" id="chat">
+<div class="chat-head">
+<h3>Nexus IA <span class="status">● EN LIGNE</span></h3>
+<button onclick="toggleChat()">✕</button>
+</div>
+<div class="chat-body" id="chat-body">
+<div class="msg bot">Pose ta question.</div>
+</div>
+<div class="chat-input">
+<input id="chat-input" placeholder="Parle..." onkeydown="if(event.key==='Enter')sendChat()">
+<button onclick="sendChat()">➤</button>
+</div>
+</div>
+
+<script>
+let currentTab = 'actors';
+
+function setTab(t) {
+currentTab = t;
+document.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
+event.target.classList.add('active');
+doSearch();
+}
+
+async function doSearch() {
+const q = document.getElementById('q').value.trim();
+if (!q) return;
+
+const results = document.getElementById('results');
+results.innerHTML = '<div class="spinner"></div>';
+
+try {
+const url = currentTab === 'actors'
+? '/api/search/actors?q=' + encodeURIComponent(q)
+: '/api/search/posts?q=' + encodeURIComponent(q);
+const r = await fetch(url);
+const d = await r.json();
+
+if (currentTab === 'actors') {
+const actors = d.actors || [];
+if (actors.length === 0) {
+results.innerHTML = '<div class="empty"><div class="icon">🤷</div><h2>Aucun acteur trouvé</h2></div>';
+return;
+}
+results.innerHTML = actors.map(a => `
+<a class="result-item" href="/profile.html?actor=${encodeURIComponent(a.handle)}">
+<div class="r-name">${escapeHtml(a.displayName || a.handle)}</div>
+<div class="r-handle">@${escapeHtml(a.handle)}</div>
+<div class="r-desc">${escapeHtml((a.description || '').substring(0, 120))}</div>
+</a>
+`).join('');
+} else {
+const posts = d.posts || [];
+if (posts.length === 0) {
+results.innerHTML = '<div class="empty"><div class="icon">🤷</div><h2>Aucun post trouvé</h2></div>';
+return;
+}
+results.innerHTML = posts.map(p => {
+const author = p.author || {};
+const record = p.record || {};
+return `
+<div class="post">
+<div class="post-head">
+${author.avatar ? '<img class="post-avatar" src="' + escapeHtml(author.avatar) + '" onerror="this.style.display=\\'none\\'">' : '<div class="post-avatar"></div>'}
+<div>
+<div class="post-author">${escapeHtml(author.displayName || author.handle || '')}</div>
+<div class="post-handle">@${escapeHtml(author.handle || '')}</div>
+</div>
+</div>
+<div class="post-text">${escapeHtml(record.text || '')}</div>
+<div class="post-meta">
+<span>❤️ ${p.likeCount || 0}</span>
+<span>💬 ${p.replyCount || 0}</span>
+</div>
+</div>
+`;
+}).join('');
+}
+} catch(e) {
+results.innerHTML = '<div class="empty"><div class="icon">❌</div><h2>Erreur</h2></div>';
+}
+}
+
+document.getElementById('q').addEventListener('keydown', e => {
+if (e.key === 'Enter') doSearch();
+});
+
+function escapeHtml(t) {
+const d = document.createElement('div');
+d.textContent = t || '';
+return d.innerHTML;
+}
+
+function toggleChat() { document.getElementById('chat').classList.toggle('open'); }
+function sendChat() {
+const inp = document.getElementById('chat-input');
+const txt = inp.value.trim();
+if (!txt) return;
+inp.value = '';
+const body = document.getElementById('chat-body');
+const u = document.createElement('div');
+u.className = 'msg user';
+u.textContent = txt;
+body.appendChild(u);
+body.scrollTop = body.scrollHeight;
+setTimeout(() => {
+const b = document.createElement('div');
+b.className = 'msg bot';
+b.textContent = 'Compris.';
+body.appendChild(b);
+body.scrollTop = body.scrollHeight;
+}, 400);
+}
+</script>
+</body>
+</html>
+SEARCHEOF
+}
+
+# ═══════════════════════════════════════════════════════════════
+# GÉNÉRATION PAGE TENDANCES
+# ═══════════════════════════════════════════════════════════════
+
+generate_trending_page() {
+cat > "$BASE/pages/trending.html" << 'TRENDEOF'
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>BlueNexus — Tendances</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+<div class="header">
+<div class="logo">BLUE<span class="dot"></span>NEXUS</div>
+<div class="header-nav">
+<a class="nav-link" href="/">Accueil</a>
+<a class="nav-link" href="/search.html">Recherche</a>
+<a class="nav-link active" href="/trending.html">Tendances</a>
+</div>
+</div>
+
+<div class="feed-title">
+<span>🔥 Posts tendances</span>
+</div>
+
+<div id="trending">
+<div class="spinner"></div>
+</div>
+
+<div class="footer">
+<b>BLUENEXUS</b> · Tendances Bluesky
+</div>
+
+</div>
+
+<button class="chat-launcher" onclick="toggleChat()">💬</button>
+
+<div class="chat-panel" id="chat">
+<div class="chat-head">
+<h3>Nexus IA <span class="status">● EN LIGNE</span></h3>
+<button onclick="toggleChat()">✕</button>
+</div>
+<div class="chat-body" id="chat-body">
+<div class="msg bot">Pose ta question.</div>
+</div>
+<div class="chat-input">
+<input id="chat-input" placeholder="Parle..." onkeydown="if(event.key==='Enter')sendChat()">
+<button onclick="sendChat()">➤</button>
+</div>
+</div>
+
+<script>
+function escapeHtml(t) {
+const d = document.createElement('div');
+d.textContent = t || '';
+return d.innerHTML;
+}
+
+async function loadTrending() {
+try {
+const r = await fetch('/api/trending');
+const d = await r.json();
+const posts = d.posts || [];
+
+if (posts.length === 0) {
+document.getElementById('trending').innerHTML =
+'<div class="empty"><div class="icon">📭</div><h2>Aucune tendance</h2></div>';
+return;
+}
+
+document.getElementById('trending').innerHTML = posts.map(p => {
+const author = p.author || {};
+const record = p.record || {};
+return `
+<div class="post">
+<div class="post-head">
+${author.avatar ? '<img class="post-avatar" src="' + escapeHtml(author.avatar) + '">' : '<div class="post-avatar"></div>'}
+<div>
+<div class="post-author">${escapeHtml(author.displayName || author.handle || '')}</div>
+<div class="post-handle">@${escapeHtml(author.handle || '')}</div>
+</div>
+</div>
+<div class="post-text">${escapeHtml(record.text || '')}</div>
+<div class="post-meta">
+<span>❤️ ${p.likeCount || 0}</span>
+<span>💬 ${p.replyCount || 0}</span>
+<span>🔁 ${p.repostCount || 0}</span>
+</div>
+</div>
+`;
+}).join('');
+} catch(e) {
+document.getElementById('trending').innerHTML =
+'<div class="empty"><div class="icon">❌</div><h2>Erreur</h2></div>';
+}
+}
+
+function toggleChat() { document.getElementById('chat').classList.toggle('open'); }
+function sendChat() {
+const inp = document.getElementById('chat-input');
+const txt = inp.value.trim();
+if (!txt) return;
+inp.value = '';
+const body = document.getElementById('chat-body');
+const u = document.createElement('div');
+u.className = 'msg user';
+u.textContent = txt;
+body.appendChild(u);
+body.scrollTop = body.scrollHeight;
+setTimeout(() => {
+const b = document.createElement('div');
+b.className = 'msg bot';
+b.textContent = 'Compris.';
+body.appendChild(b);
+body.scrollTop = body.scrollHeight;
+}, 400);
+}
+
+loadTrending();
+</script>
+</body>
+</html>
+TRENDEOF
+}
+
+# ═══════════════════════════════════════════════════════════════
+# GÉNÉRATION PAGE À PROPOS
+# ═══════════════════════════════════════════════════════════════
+
+generate_about_page() {
+cat > "$BASE/pages/about.html" << 'ABOUTEOF'
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>BlueNexus — À propos</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+<div class="header">
+<div class="logo">BLUE<span class="dot"></span>NEXUS</div>
+<div class="header-nav">
+<a class="nav-link" href="/">Accueil</a>
+<a class="nav-link" href="/search.html">Recherche</a>
+<a class="nav-link active" href="/about.html">À propos</a>
+</div>
+</div>
+
+<div class="profile">
+<div class="profile-top">
+<div class="profile-avatar" style="display:flex;align-items:center;justify-content:center;font-size:44px">🌐</div>
+<div class="profile-info">
+<div class="profile-name">BlueNexus</div>
+<div class="profile-handle">Version 2.0</div>
+<div class="profile-bio">Plateforme sociale décentralisée basée sur Bluesky + IA locale Nexus.</div>
+</div>
+</div>
+</div>
+
+<div class="profile">
+<h3 style="color:#00d4ff;margin-bottom:14px;font-size:14px;letter-spacing:2px">FONCTIONNALITÉS</h3>
+<div style="color:#aaa;font-size:13px;line-height:1.8">
+✓ Recherche multi-profils Bluesky<br>
+✓ Affichage feed complet<br>
+✓ Tendances et suggestions<br>
+✓ Chat IA local (Nexus)<br>
+✓ Cache intelligent<br>
+✓ 100% Bash<br>
+✓ Zéro cloud<br>
+✓ API Bluesky publique
+</div>
+</div>
+
+<div class="profile">
+<h3 style="color:#00d4ff;margin-bottom:14px;font-size:14px;letter-spacing:2px">TECHNOLOGIE</h3>
+<div style="color:#aaa;font-size:13px;line-height:1.8">
+Backend : Bash + Python HTTP Server<br>
+API : Bluesky AT Protocol<br>
+Frontend : HTML5 + CSS3 + JS<br>
+IA : Nexus (règles locales)<br>
+Stockage : Fichiers plats + Cache MD5
+</div>
+</div>
+
+<div class="profile">
+<h3 style="color:#00d4ff;margin-bottom:14px;font-size:14px;letter-spacing:2px">AUTEUR</h3>
+<div style="color:#aaa;font-size:13px;line-height:1.8">
+Aissa Mohammedi DSK<br>
+Forgeron Suprême<br>
+DGK · CodeGod X7 100V
+</div>
+</div>
+
+<div class="footer">
+<b>BLUENEXUS</b> · 2026
+</div>
+
+</div>
+</body>
+</html>
+ABOUTEOF
+}
+
+# ═══════════════════════════════════════════════════════════════
+# SERVEUR HTTP AVEC ROUTES API
+# ═══════════════════════════════════════════════════════════════
+
+generate_server() {
+cat > "$BASE/server.py" << 'SERVEREOF'
+#!/usr/bin/env python3
+import http.server
+import socketserver
+import json
+import os
+import sys
+import subprocess
+import urllib.request
+import urllib.parse
+import ssl
+import hashlib
+from pathlib import Path
+
+PORT = int(sys.argv[1])
+BASE = Path("/tmp/bluenexus")
+PAGES = BASE / "pages"
+
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+def bsky_get(path):
+url = "https://public.api.bsky.app" + path
+try:
+req = urllib.request.Request(url, headers={
+"User-Agent": "BlueNexus/2.0",
+"Accept": "application/json"
+})
+with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as r:
+return json.loads(r.read().decode("utf-8"))
+except Exception as e:
+return {"error": str(e)}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+def log_message(self, *a): pass
+
+def _json(self, data, code=200):
+body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", "application/json; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.end_headers()
+try: self.wfile.write(body)
+except: pass
+
+def _html(self, path, code=200):
+if not path.exists():
+self.send_response(404); self.end_headers(); return
+body = path.read_bytes()
+self.send_response(code)
+self.send_header("Content-Type", "text/html; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+try: self.wfile.write(body)
+except: pass
+
+def _css(self, path):
+if not path.exists():
+self.send_response(404); self.end_headers(); return
+body = path.read_bytes()
+self.send_response(200)
+self.send_header("Content-Type", "text/css; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+try: self.wfile.write(body)
+except: pass
+
+def do_GET(self):
+path = urllib.parse.urlparse(self.path).path
+qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+# CSS
+if path == "/style.css":
+return self._css(PAGES / "style.css")
+
+# Pages HTML
+if path == "/" or path == "/index.html":
+return self._html(PAGES / "index.html")
+if path == "/profile.html":
+return self._html(PAGES / "profile.html")
+if path == "/search.html":
+return self._html(PAGES / "search.html")
+if path == "/trending.html":
+return self._html(PAGES / "trending.html")
+if path == "/about.html":
+return self._html(PAGES / "about.html")
+
+# API profil
+if path == "/api/profile":
+actor = qs.get("actor", ["bsky.app"])[0]
+data = bsky_get(f"/xrpc/app.bsky.actor.getProfile?actor={urllib.parse.quote(actor)}")
+return self._json(data)
+
+# API feed
+if path == "/api/feed":
+actor = qs.get("actor", ["bsky.app"])[0]
+limit = qs.get("limit", ["20"])[0]
+data = bsky_get(f"/xrpc/app.bsky.feed.getAuthorFeed?actor={urllib.parse.quote(actor)}&limit={limit}")
+return self._json(data)
+
+# API suggestions
+if path == "/api/suggestions":
+data = bsky_get("/xrpc/app.bsky.actor.getSuggestions?limit=25")
+return self._json(data)
+
+# API recherche acteurs
+if path == "/api/search/actors":
+q = qs.get("q", [""])[0]
+data = bsky_get(f"/xrpc/app.bsky.actor.searchActors?q={urllib.parse.quote(q)}&limit=25")
+return self._json(data)
+
+# API recherche posts
+if path == "/api/search/posts":
+q = qs.get("q", [""])[0]
+data = bsky_get(f"/xrpc/app.bsky.feed.searchPosts?q={urllib.parse.quote(q)}&limit=25")
+return self._json(data)
+
+# API tendances
+if path == "/api/trending":
+data = bsky_get("/xrpc/app.bsky.unspecced.getPopularFeedGenerators?limit=25")
+return self._json(data)
+
+# API status
+if path == "/api/status":
+return self._json({
+"engine": "BlueNexus v2.0",
+"status": "running",
+"port": PORT,
+"pages": 5,
+"apis": ["profile", "feed", "suggestions", "search/actors", "search/posts", "trending"]
+})
+
+self.send_response(404)
+self.end_headers()
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+def main():
+os.chdir(str(PAGES))
+with Server(("0.0.0.0", PORT), Handler) as httpd:
+httpd.serve_forever()
+
+
+if __name__ == "__main__":
+main()
+SERVEREOF
+}
+
+# ═══════════════════════════════════════════════════════════════
+# EXÉCUTION
+# ═══════════════════════════════════════════════════════════════
+
+echo "[1/4] Génération CSS..."
+generate_css
+echo " ✅ CSS généré"
+
+echo "[2/4] Génération pages HTML..."
+generate_home
+generate_profile_page
+generate_search_page
+generate_trending_page
+generate_about_page
+echo " ✅ 5 pages générées"
+
+echo "[3/4] Génération serveur HTTP..."
+generate_server
+echo " ✅ Serveur généré"
+
+echo "[4/4] Lancement..."
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo " 🌐 BlueNexus : http://localhost:$PORT"
+echo " 📄 Pages : Accueil · Profil · Recherche · Tendances · À propos"
+echo " 🔌 APIs : profile · feed · suggestions · search · trending"
+echo " 🤖 IA : Nexus locale (bouton 💬 en bas)"
+echo "════════════════════════════════════════════════════════════"
+echo ""
+
+python3 "$BASE/server.py" "$PORT"
+SCRIPT_EOF
+
+chmod +x bluenexus.sh
+./bluenexus.sh 8080
