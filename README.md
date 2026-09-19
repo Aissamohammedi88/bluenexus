@@ -97,4 +97,4 @@ MIT — voir [LICENSE](LICENSE).
 Aissa Mohammedi (DSK) — [GitHub](https://github.com/Aissamohammedi88)
 
 ---
-*BlueNexus : le réseau plaforme client
+*BlueNexus : le réseau platforme client
